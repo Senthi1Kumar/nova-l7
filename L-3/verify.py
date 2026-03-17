@@ -24,6 +24,35 @@ import time
 import numpy as np
 from pathlib import Path
 
+# Monkey-patch: speechbrain 1.0.x passes `use_auth_token` to hf_hub_download,
+# but huggingface_hub >=0.17 renamed it to `token` and removed the old kwarg.
+try:
+    import huggingface_hub as _hf
+    _orig_hf_download = _hf.hf_hub_download
+    def _patched_hf_download(*args, **kwargs):
+        # speechbrain 1.0.x passes use_auth_token; newer huggingface_hub renamed it to token.
+        if "use_auth_token" in kwargs:
+            kwargs["token"] = kwargs.pop("use_auth_token") or None
+        try:
+            return _orig_hf_download(*args, **kwargs)
+        except Exception as e:
+            # SpeechBrain's fetch() converts HTTPError 404 → ValueError so that
+            # from_hparams() can silently skip missing custom.py.
+            # Newer huggingface_hub uses httpx (not requests), so HTTPError is never
+            # raised and the ValueError conversion never fires — the 404 propagates raw.
+            # Fix: if we see a 404 for custom.py, raise ValueError directly so
+            # SpeechBrain's `except ValueError` handler in from_hparams() catches it.
+            filename = args[1] if len(args) > 1 else kwargs.get("filename", "")
+            is_404 = ("404" in str(e) or "Not Found" in str(e) or
+                      "EntryNotFound" in type(e).__name__ or
+                      "RemoteEntryNotFound" in type(e).__name__)
+            if "custom.py" in str(filename) and is_404:
+                raise ValueError("File not found on HF hub") from e
+            raise
+    _hf.hf_hub_download = _patched_hf_download
+except Exception:
+    pass
+
 sys.path.insert(0, str(Path(__file__).parent))
 from crypto_utils import save_array, load_array
 
@@ -169,22 +198,22 @@ def verify_voice(driver_id: str,
         }
 
     if audio_buffer is not None:
-        if verbose: print(f"  [verify] Using provided audio buffer from pipeline")
+        if verbose: print("  [verify] Using provided audio buffer from pipeline")
         wav_path = save_temp_wav(audio_buffer, f"{driver_id}_live")
     else:
-        if verbose: print(f"  [verify] Recording voice... speak now (2.5 sec)")
+        if verbose: print("  [verify] Recording voice... speak now (2.5 sec)")
         # Record live audio
         audio = record_live(duration=2.5)
         wav_path = save_temp_wav(audio, f"{driver_id}_live")
 
     if verbose:
-        print(f"  [verify] Extracting live fingerprint...")
+        print("  [verify] Extracting live fingerprint...")
 
     # Extract live fingerprint
     live_fp = extract_live_fingerprint(wav_path)
 
     if verbose:
-        print(f"  [verify] Loading stored fingerprint...")
+        print("  [verify] Loading stored fingerprint...")
 
     # Load stored fingerprint (decrypts automatically)
     stored_fp = load_array(stored_path)
@@ -245,7 +274,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     print(f"\n{'='*50}")
-    print(f"  NOVA — Voice Verification")
+    print("  NOVA — Voice Verification")
     print(f"  Driver: {args.driver}")
     print(f"  Mode:   {'PAYMENT (0.92)' if args.payment else 'NORMAL (0.85)'}")
     print(f"{'='*50}\n")
@@ -262,4 +291,4 @@ if __name__ == "__main__":
         print(f"  🎉 Welcome back, {args.driver}!")
     else:
         print(f"  ⛔ Voice not recognized. Score {result['score']} < {result['threshold']}")
-        print(f"     Fallback to PIN or Face ID required.")
+        print("     Fallback to PIN or Face ID required.")
