@@ -3,8 +3,8 @@ NOVA Layer 7 - Dialogue Manager
 
 AGREED FLOW:
 ──────────────────────────────────────────────────
-1. No voice auth blocking in web — NEEDS_VERIFICATION = []
-2. Payment flow: order → merchant → yes → Voice OTP → payment
+1. Voice verification required for payment — NEEDS_VERIFICATION = ["payment"]
+2. Payment flow: order → merchant → yes → voice verify → Voice OTP → payment
 3. OTP fail x2 → PIN fallback → payment denied if PIN fails
 4. Location check after OTP pass
 5. Session expiry warning at < 2 min (session_start tracked)
@@ -59,8 +59,7 @@ except ImportError:
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-NEEDS_VERIFICATION     = []          # [] = no voice auth blocking in web
-                                     # add "payment" when WebSocket mic ready
+NEEDS_VERIFICATION     = ["payment"]  # voice verification required before payment OTP
 CONTEXT_DECAY_SECONDS  = 300
 QUEUE_MAX              = 5
 OTP_MAX_ATTEMPTS       = 2
@@ -223,7 +222,7 @@ REQUIRED_SLOTS = {
 SLOT_QUESTIONS = {
     "destination": "Where would you like to go?",
     "contact":     "Who would you like to call or message?",
-    "component":   "Which component — AC, window, heater, or lights?",
+    "component":   "Which component — AC, window, heater, sunroof, or lights?",
     "action":      "Should I turn it on or off?",
 }
 
@@ -250,10 +249,17 @@ NUMBER_WORDS = {
 
 # ── Route handlers ────────────────────────────────────────────────────────────
 def handle_vehicle_control(entities: dict) -> dict:
-    component = entities.get("component", "system")
-    action    = entities.get("action", "on")
+    commands = entities.get("commands")
+    if commands and len(commands) > 1:
+        # Compound command: "switch off the AC and open the sunroof"
+        parts = [f"{c['component'].upper()} turned {c['action']}" for c in commands]
+        message = "Done. " + ", ".join(parts) + "."
+    else:
+        component = entities.get("component", "system")
+        action    = entities.get("action", "on")
+        message = f"Done. {component.upper()} turned {action}."
     return build_response(
-        message=f"Done. {component.upper()} turned {action}.",
+        message=message,
         state="IDLE", intent="vehicle_control",
         routing="Direct hardware command via CAN bus — no AI, no cost, under 50ms",
         entities=entities, action="hardware_command"
@@ -906,6 +912,22 @@ class DialogueManager:
     # STATE HANDLERS
     # ══════════════════════════════════════════════════════════════════════════
 
+    def _start_otp(self, prefix_msg: str = "") -> dict:
+        """Generate OTP and transition to OTP_PENDING. Used after verification passes."""
+        self.state.fsm_state    = "OTP_PENDING"
+        self.state.otp_attempts = 0
+        otp = generate_otp()
+        self._otp_active = otp
+        msg = f"{prefix_msg} Voice OTP: Please repeat — {otp_to_words(otp)}.".strip()
+        return build_response(
+            message=msg,
+            state="OTP_PENDING", intent="payment",
+            routing="Voice OTP — unique per transaction",
+            otp=otp,
+            verification_status="passed",
+            session_started=True,
+        )
+
     def _handle_verify_voice(self, user_input: str, audio_buffer=None) -> dict:
         print(f"[Layer 7] Starting Layer 3 auth for: {self._driver_id}")
         
@@ -925,8 +947,12 @@ class DialogueManager:
             # Voice passed! Create token.
             token = _create_and_register_token(self._driver_id, "voice", verbose=True)
             self._start_session(token)
+
+            # Payment flow: proceed to OTP instead of re-routing
+            if self.state.current_intent == "payment":
+                return self._start_otp("Voice recognized. Identity verified.")
+
             self.state.fsm_state = "IDLE"
-            
             filled = IntentResult(
                 intent=self.state.current_intent, confidence=1.0,
                 entities=self.state.pending_entities, raw_text=user_input
@@ -936,11 +962,15 @@ class DialogueManager:
             response["session_started"]     = True
             response["verification_status"] = "passed"
             return response
-            
+
         elif not L3_AVAILABLE:
             # Simulation
             self.state.session_start = time.time()
             self.state.session_valid = True
+
+            if self.state.current_intent == "payment":
+                return self._start_otp("Identity verified. ")
+
             self.state.fsm_state = "IDLE"
             filled = IntentResult(
                 intent=self.state.current_intent, confidence=1.0,
@@ -973,8 +1003,11 @@ class DialogueManager:
                 
             token = _create_and_register_token(self._driver_id, "pin", verbose=True)
             self._start_session(token)
+
+            if self.state.current_intent == "payment":
+                return self._start_otp("PIN accepted. Identity verified.")
+
             self.state.fsm_state = "IDLE"
-            
             filled = IntentResult(
                 intent=self.state.current_intent, confidence=1.0,
                 entities=self.state.pending_entities, raw_text=user_input
@@ -984,7 +1017,7 @@ class DialogueManager:
             response["session_started"]     = True
             response["verification_status"] = "passed"
             return response
-            
+
     def _handle_verify_face(self, user_input: str) -> dict:
         if L3_AVAILABLE:
             result = verify_face(self._driver_id, verbose=True)
@@ -997,11 +1030,14 @@ class DialogueManager:
                     routing="Layer 3 — all levels failed",
                     action="verification_failed", verification_status="failed"
                 )
-                
+
             token = _create_and_register_token(self._driver_id, "face", verbose=True)
             self._start_session(token)
+
+            if self.state.current_intent == "payment":
+                return self._start_otp("Face recognized. Identity verified.")
+
             self.state.fsm_state = "IDLE"
-            
             filled = IntentResult(
                 intent=self.state.current_intent, confidence=1.0,
                 entities=self.state.pending_entities, raw_text=user_input
@@ -1048,6 +1084,16 @@ class DialogueManager:
             return handle_order_flow({}, user_input, self.state)
 
         if any(w in user_lower for w in CONFIRM_YES):
+            # Voice verification required before OTP if not already verified
+            if "payment" in NEEDS_VERIFICATION and not self._is_session_valid():
+                self.state.fsm_state = "VERIFY"
+                return build_response(
+                    message="Order confirmed. Please say anything to verify your identity.",
+                    state="VERIFY", intent="payment",
+                    routing="Layer 3 — voice verification required before payment",
+                    verification_status="needed"
+                )
+            # Already verified (or verification not required) — proceed to OTP
             self.state.fsm_state    = "OTP_PENDING"
             self.state.otp_attempts = 0
             otp = generate_otp()
@@ -1078,8 +1124,15 @@ class DialogueManager:
         OTP match → location check → payment.
         Fail x OTP_MAX_ATTEMPTS → PIN fallback.
         """
-        spoken = [NUMBER_WORDS[w.strip(".,!?")] for w in user_input.lower().split()
-                  if w.strip(".,!?") in NUMBER_WORDS]
+        # Parse spoken digits — handles both "seven two eight one" and "7281"
+        spoken = []
+        for w in user_input.lower().split():
+            w = w.strip(".,!?")
+            if w in NUMBER_WORDS:
+                spoken.append(NUMBER_WORDS[w])
+            elif w.isdigit() and len(w) > 1:
+                # Concatenated digits like "7281" → [7, 2, 8, 1]
+                spoken.extend(int(c) for c in w)
 
         if spoken == self._otp_active:
             self._otp_active        = None

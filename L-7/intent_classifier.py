@@ -1,20 +1,13 @@
 """
-NOVA Layer 7 - Intent Classifier
-Classifies user commands into categories.
-Runs on device, no internet, no AI model needed.
-
-UPDATES:
-- Food/drink ordering keywords added
-- Merchant name extraction (Starbucks, Subway etc)
-- Item name extraction (frappuccino, latte etc)
-- Improved payment patterns
-- Dollar + Rupee amount extraction
+NOVA Layer 7 - Intent Classifier (Moonshine Voice)
+Replaces regex-based classification with Gemma-300M semantic embeddings.
 """
 
 import re
+import logging
 from dataclasses import dataclass
-from typing import Optional
 
+logger = logging.getLogger("IntentClassifier")
 
 @dataclass
 class IntentResult:
@@ -23,89 +16,7 @@ class IntentResult:
     entities: dict       # extracted info from command
     raw_text: str        # original command
 
-
-# ── Keyword rules for each intent ──────────────────────────────────────────
-
-INTENT_RULES = {
-
-    "stop": [
-        r"\bstop\b", r"\bcancel\b", r"\bquit\b",
-        r"\bshut up\b", r"\bnevermind\b", r"\bnever mind\b"
-    ],
-
-    "vehicle_control": [
-        r"\bturn (on|off)\b", r"\bswitch (on|off)\b",
-        r"\bac\b", r"\bair condition\b", r"\bair con\b",
-        r"\bwindow(s)?\b", r"\bwiper(s)?\b", r"\bheater\b",
-        r"\bfan\b", r"\blights?\b", r"\bheadlight(s)?\b",
-        r"\bseat(s)?\b", r"\bvolume\b", r"\bmute\b",
-        r"\bhorn\b", r"\bparking\b", r"\bbrake(s)?\b",
-        r"\bopen\b", r"\bclose\b", r"\badjust\b",
-        r"\bincrease\b", r"\bdecrease\b", r"\bhigher\b", r"\blower\b"
-    ],
-
-    "navigation": [
-        r"\bnavigate\b", r"\bdirections?\b", r"\bgo to\b",
-        r"\btake me\b", r"\bdrive to\b", r"\bhead to\b",
-        r"\broute to\b", r"\bhow (far|long)\b", r"\bdistance\b",
-        r"\beta\b", r"\bnearest\b", r"\bclosest\b",
-        r"\bwhere is\b", r"\bfind\b.*\bnear\b",
-        r"\bmap\b", r"\btraffic\b", r"\bavoide?\b"
-    ],
-
-    "media": [
-        r"\bplay\b", r"\bpause music\b", r"\bstop music\b",
-        r"\bnext (song|track|music)\b", r"\bprevious (song|track)\b",
-        r"\bshuffle\b", r"\bskip\b",
-        r"\bspotify\b", r"\bmusic\b", r"\bsong\b",
-        r"\bradio\b", r"\bpodcast\b", r"\bplaylist\b",
-        r"\bvolume up\b", r"\bvolume down\b"
-    ],
-
-    "payment": [
-        # Action keywords
-        r"\bpay\b", r"\border\b", r"\bbook\b", r"\bbuy\b",
-        r"\bpurchase\b", r"\btransaction\b", r"\bcheckout\b",
-        r"\bcharge\b", r"\bsend money\b", r"\btransfer\b",
-        r"\bi want\b", r"\bget me\b", r"\bi('d| would) like\b",
-
-        # Food and drink
-        r"\bcoffee\b", r"\blatte\b", r"\bcappuccino\b",
-        r"\bespresso\b", r"\bfrappuccino\b", r"\bcold brew\b",
-        r"\btea\b", r"\bjuice\b", r"\bsmoothie\b",
-        r"\bsandwich\b", r"\bburger\b", r"\bpizza\b",
-        r"\bsub\b", r"\bwrap\b", r"\bsalad\b",
-        r"\bbreakfast\b", r"\blunch\b", r"\bdinner\b",
-        r"\bsnack\b", r"\bfood\b", r"\bmeal\b",
-        r"\bdrink\b", r"\bbeverage\b",
-
-        # Merchants
-        r"\bstarbucks\b", r"\bsubway\b", r"\bmcdonald(s)?\b",
-        r"\bpizza hut\b", r"\bdomino(s)?\b", r"\bkfc\b",
-        r"\bblu(e)? bottle\b", r"\bdunkin\b", r"\btim hortons\b",
-        r"\bchipotle\b", r"\bpanda express\b",
-
-        # Fuel and services
-        r"\bfuel\b", r"\bgas\b", r"\bpetrol\b",
-        r"\bparking\b.*\bpay\b", r"\bpay.*\bparking\b",
-    ],
-
-    "communication": [
-        r"\bcall\b", r"\bphone\b", r"\bdial\b", r"\bring\b",
-        r"\btext\b", r"\bsend.*message\b", r"\bwhatsapp\b",
-        r"\bsms\b", r"\bmessage\b"
-    ],
-
-    "general_question": [
-        r"\bwhat\b", r"\bhow\b", r"\bwhy\b", r"\bwhen\b",
-        r"\bwhere\b", r"\bwho\b", r"\btell me\b", r"\bexplain\b",
-        r"\bwhat is\b", r"\bwhat are\b", r"\bcan you\b",
-        r"\bweather\b", r"\bnews\b", r"\btime\b", r"\bdate\b"
-    ],
-}
-
-
-# ── Known merchants and items for extraction ────────────────────────────────
+# ── Entity extractors (Regex for slot filling is still useful here) ────────
 
 KNOWN_MERCHANTS = [
     "starbucks", "subway", "mcdonalds", "mcdonald's",
@@ -125,9 +36,6 @@ KNOWN_ITEMS = [
     "coffee", "tea", "juice", "smoothie"
 ]
 
-
-# ── Entity extractors ───────────────────────────────────────────────────────
-
 def extract_entities(text: str, intent: str) -> dict:
     entities  = {}
     text_lower = text.lower()
@@ -143,18 +51,46 @@ def extract_entities(text: str, intent: str) -> dict:
             entities["destination"] = None
 
     if intent == "vehicle_control":
-        controls = ["ac", "window", "heater", "fan",
-                    "lights", "seat", "wiper", "horn"]
-        for control in controls:
-            if control in text_lower:
-                entities["component"] = control
-                break
-        if any(w in text_lower for w in
-               ["on", "open", "increase", "higher", "up"]):
-            entities["action"] = "on"
-        elif any(w in text_lower for w in
-                 ["off", "close", "decrease", "lower", "down"]):
-            entities["action"] = "off"
+        controls = ["ac", "window", "sunroof", "heater", "fan",
+                    "lights", "light", "seat", "wiper", "horn", "defrost"]
+        component_aliases = {"roof": "sunroof", "a/c": "ac", "air conditioning": "ac",
+                             "sound roof": "sunroof", "sun roof": "sunroof", "dac": "ac"}
+
+        # Split on " and " to handle compound commands like
+        # "switch off the AC and open the sunroof"
+        clauses = [c.strip() for c in re.split(r'\band\b', text_lower) if c.strip()]
+
+        all_commands = []
+        for clause in clauses:
+            comp = None
+            for control in controls:
+                if control in clause:
+                    comp = control
+                    break
+            if not comp:
+                for alias, canonical in component_aliases.items():
+                    if alias in clause:
+                        comp = canonical
+                        break
+            if not comp:
+                continue
+
+            action = None
+            if any(w in clause for w in ["off", "close", "decrease", "lower", "down"]):
+                action = "off"
+            elif any(w in clause for w in ["on", "open", "increase", "higher", "up",
+                                           "switch", "turn"]):
+                action = "on"
+            else:
+                action = "on"  # default
+            all_commands.append({"component": comp, "action": action})
+
+        if all_commands:
+            # Single command — flat entities for backward compat
+            entities["component"] = all_commands[0]["component"]
+            entities["action"] = all_commands[0]["action"]
+            if len(all_commands) > 1:
+                entities["commands"] = all_commands
 
     if intent == "media":
         play_match = re.search(r"play\s+(.+)", text_lower)
@@ -162,36 +98,31 @@ def extract_entities(text: str, intent: str) -> dict:
             entities["query"] = play_match.group(1).strip()
 
     if intent == "payment":
-        # ── Extract size ─────────────────────────────────────────────────
         sizes = ["small", "medium", "large", "grande", "venti", "tall", "regular", "extra large"]
         for size in sizes:
             if size in text_lower:
                 entities["size"] = size
                 break
                 
-        # ── Extract quantity ─────────────────────────────────────────────
         quantity_map = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "a": 1, "an": 1}
         qty_match = re.search(r"\b(one|two|three|four|five|a|an|\d+)\b", text_lower)
         if qty_match:
             word = qty_match.group(1)
-            entities["quantity"] = quantity_map.get(word, int(word) if word.isdigit() else 1)
+            raw_qty = quantity_map.get(word, int(word) if word.isdigit() else 1)
+            entities["quantity"] = min(raw_qty, 10)  # Cap at 10 to prevent STT mishearing "100 ml" etc.
         else:
             entities["quantity"] = 1
 
-        # ── Extract merchant name ────────────────────────────────────────
         for merchant in KNOWN_MERCHANTS:
             if merchant in text_lower:
                 entities["merchant"] = merchant
                 break
 
-        # ── Extract item name ────────────────────────────────────────────
-        # Try longest match first
         for item in sorted(KNOWN_ITEMS, key=len, reverse=True):
             if item in text_lower:
                 entities["item"] = item
                 break
 
-        # If no known item — try to extract after "order/get/buy/want"
         if not entities.get("item"):
             item_match = re.search(
                 r"(?:order|get me|buy|i want|i'd like|give me)\s+(?:a\s+|an\s+)?(.+?)(?:\s+from|\s+at|\s+near|$)",
@@ -200,13 +131,10 @@ def extract_entities(text: str, intent: str) -> dict:
             if item_match:
                 entities["item"] = item_match.group(1).strip()
 
-        # ── Extract amount ───────────────────────────────────────────────
-        # Dollar amounts
         dollar_match = re.search(r"\$\s*(\d+(?:\.\d{1,2})?)", text_lower)
         if dollar_match:
             entities["amount"] = dollar_match.group(1)
 
-        # Rupee amounts
         if not entities.get("amount"):
             rupee_match = re.search(
                 r"(?:rs\.?|rupees?|inr)?\s*(\d+)", text_lower
@@ -214,8 +142,6 @@ def extract_entities(text: str, intent: str) -> dict:
             if rupee_match:
                 entities["amount"] = rupee_match.group(1)
 
-        # ── Build query for merchant search ─────────────────────────────
-        # Combine merchant + item as search query
         if entities.get("merchant") and entities.get("item"):
             entities["query"] = f"{entities['item']} from {entities['merchant']}"
         elif entities.get("merchant"):
@@ -232,64 +158,153 @@ def extract_entities(text: str, intent: str) -> dict:
 
     return entities
 
-
 # ── Main classifier ─────────────────────────────────────────────────────────
 
 class IntentClassifier:
+    def __init__(self):
+        try:
+            from moonshine_voice import IntentRecognizer, get_embedding_model
+            from moonshine_voice.intent_recognizer import IntentMatch
+            
+            logger.info("Initializing Moonshine Intent Recognizer (gemma-300m)...")
+            embedding_model_path, embedding_model_arch = get_embedding_model("embeddinggemma-300m", "q4")
+            
+            self.recognizer = IntentRecognizer(
+                model_path=embedding_model_path,
+                model_arch=embedding_model_arch,
+                model_variant="q4",
+                threshold=0.55  # Slightly lowered to catch natural phrasing
+            )
+            
+            # Map canonical trigger phrases back to our broader intent categories
+            self.trigger_to_intent = {
+                "stop talking": "stop",
+                "cancel order": "stop",
+                "shut up": "stop",
+                
+                "turn on the AC": "vehicle_control",
+                "turn off the lights": "vehicle_control",
+                "roll down the windows": "vehicle_control",
+                "adjust the fan": "vehicle_control",
+                "switch on the heater": "vehicle_control",
+                "turn on the heater": "vehicle_control",
+                "open the sunroof": "vehicle_control",
+                "turn on the seat heater": "vehicle_control",
+                
+                "navigate to the airport": "navigation",
+                "take me home": "navigation",
+                "give me directions": "navigation",
+                "where is the nearest": "navigation",
+                
+                "play some music": "media",
+                "pause the song": "media",
+                "skip this track": "media",
+                
+                "order a coffee": "payment",
+                "buy a burger": "payment",
+                "pay for parking": "payment",
+                "i want to order food": "payment",
+                
+                "call mom": "communication",
+                "send a text message": "communication",
+                "dial this number": "communication",
+                
+                "what is the weather like": "general_question",
+                "tell me the news": "general_question",
+                "what time is it": "general_question",
+                "who is the president": "general_question"
+            }
+            
+            for trigger in self.trigger_to_intent.keys():
+                # We register them with a no-op handler because we will capture the intent via set_on_intent
+                self.recognizer.register_intent(trigger, lambda t, u, s: None)
+                
+            self.latest_match = None
+            def on_match(match: IntentMatch):
+                self.latest_match = match
+                
+            self.recognizer.set_on_intent(on_match)
+            logger.info("Moonshine Intent Recognizer ready.")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize Moonshine IntentRecognizer: {e}")
+            self.recognizer = None
 
     def classify(self, text: str) -> IntentResult:
+        if not text or not text.strip():
+            return IntentResult(intent="unknown", confidence=0.0, entities={}, raw_text=text)
+
+        # 1. High-priority keyword override (Stop/Emergency)
         text_clean = text.strip().lower()
-        scores: dict[str, float] = {}
+        if any(w in text_clean for w in ["stop", "cancel", "shut up", "nevermind"]):
+            return IntentResult(intent="stop", confidence=1.0, entities={}, raw_text=text)
 
-        for intent, patterns in INTENT_RULES.items():
-            match_count = sum(
-                1 for pattern in patterns
-                if re.search(pattern, text_clean)
-            )
-            if match_count > 0:
-                scores[intent] = min(float(match_count) / 3.0, 1.0)
+        # 1b. Vehicle control keyword override (reliable, no ML needed)
+        _vc_components = ["ac", "dac", "heater", "fan", "window", "wiper", "horn",
+                          "lights", "light", "seat", "sunroof", "sun roof",
+                          "sound roof", "defrost", "air conditioning", "temperature"]
+        _vc_action_words = ["on", "off", "open", "close", "up", "down",
+                            "increase", "decrease", "higher", "lower",
+                            "switch", "turn", "adjust", "set"]
+        _has_component = any(c in text_clean for c in _vc_components)
+        _has_action    = any(a in text_clean for a in _vc_action_words)
+        if _has_component and _has_action:
+            entities = extract_entities(text, "vehicle_control")
+            if entities.get("component"):
+                return IntentResult(intent="vehicle_control", confidence=0.95,
+                                    entities=entities, raw_text=text)
 
-        if not scores:
-            return IntentResult(
-                intent="general_question",
-                confidence=0.5,
-                entities={},
-                raw_text=text
-            )
+        # 1c. Navigation keyword override
+        _nav_triggers = ["navigate", "go to", "take me to", "drive to",
+                         "route to", "directions to", "head to", "how do i get to"]
+        if any(t in text_clean for t in _nav_triggers):
+            entities = extract_entities(text, "navigation")
+            return IntentResult(intent="navigation", confidence=0.95,
+                                entities=entities, raw_text=text)
 
-        best_intent = max(scores, key=lambda k: scores[k])
-        confidence  = scores[best_intent]
+        if not self.recognizer:
+            # Fallback to general question if ML fails
+            return IntentResult(intent="general_question", confidence=0.5, entities={}, raw_text=text)
 
-        # stop always wins
-        if "stop" in scores:
-            best_intent = "stop"
-            confidence  = 1.0
+        # 2. Semantic Embedding Classification
+        self.latest_match = None
+        self.recognizer.process_utterance(text_clean)
+        
+        if self.latest_match:
+            best_intent = self.trigger_to_intent[self.latest_match.trigger_phrase]
+            confidence = round(self.latest_match.similarity, 2)
+        else:
+            best_intent = "general_question"
+            confidence = 0.5
+            
+        # 3. Knowledge override
+        if best_intent != "general_question":
+            knowledge_keywords = [r"\bnews\b", r"\bweather\b", r"\btell me about\b",
+                                  r"\bwhat is\b", r"\bwho is\b", r"\bknow about\b",
+                                  r"\blatest\b", r"\bwhat happened\b", r"\btoday\b"]
+            if any(re.search(p, text_clean) for p in knowledge_keywords):
+                best_intent = "general_question"
+                confidence = 0.9
 
         entities = extract_entities(text, best_intent)
 
         return IntentResult(
             intent=best_intent,
-            confidence=round(confidence, 2),
+            confidence=confidence,
             entities=entities,
             raw_text=text
         )
-
-
-# ── Quick test ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     classifier = IntentClassifier()
 
     test_commands = [
-        # Original tests
         "turn on the AC",
         "navigate to the airport",
         "play some relaxing music",
         "call mom",
         "stop",
         "what is the weather today",
-
-        # New food ordering tests
         "order a frappuccino from Starbucks",
         "I want a caramel latte",
         "get me a coffee",
@@ -301,13 +316,13 @@ if __name__ == "__main__":
     ]
 
     print("\n" + "="*60)
-    print("  NOVA Layer 7 — Intent Classifier Test")
+    print("  NOVA Layer 7 — Intent Classifier Test (Moonshine ML)")
     print("="*60)
 
     for cmd in test_commands:
         result = classifier.classify(cmd)
-        print(f"\n  Input    : {cmd}")
-        print(f"  Intent   : {result.intent}")
+        print(f"\n  Input     : {cmd}")
+        print(f"  Intent    : {result.intent}")
         print(f"  Confidence: {result.confidence}")
-        print(f"  Entities : {result.entities}")
+        print(f"  Entities  : {result.entities}")
         print("  " + "-"*55)
