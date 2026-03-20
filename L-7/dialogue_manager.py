@@ -109,6 +109,7 @@ class DialogueState:
     # Conversation
     history: list = field(default_factory=list)
     last_interaction: float = field(default_factory=time.time)
+    last_vehicle_components: list = field(default_factory=list)
 
     # FIFO buffer
     command_buffer: list = field(default_factory=list)
@@ -258,6 +259,10 @@ def handle_vehicle_control(entities: dict) -> dict:
         component = entities.get("component", "system")
         action    = entities.get("action", "on")
         message = f"Done. {component.upper()} turned {action}."
+    if entities.get("temperature_c"):
+        message += f" Temperature set to {entities['temperature_c']}°C."
+    if entities.get("fan_speed"):
+        message += f" Fan speed: {entities['fan_speed']}."
     return build_response(
         message=message,
         state="IDLE", intent="vehicle_control",
@@ -289,7 +294,7 @@ def handle_general_question(text: str, history: list) -> dict:
     return build_response(
         message=f"Let me think about that...",
         state="IDLE", intent="general_question",
-        routing="Local Qwen3.5 LLM with context",
+        routing="Local LLM with context",
         entities={}, action="llm_call",
         original_text=text
     )
@@ -316,15 +321,17 @@ def handle_order_flow(entities: dict, raw_text: str, dm_state) -> dict:
     if dm_state.pending_entities.get("merchants"):
         merchants  = dm_state.pending_entities["merchants"]
         text_lower = raw_text.lower()
+        import re as _re
 
-        number_map = {
-            "1": 0, "first": 0, "one": 0,
-            "2": 1, "second": 1, "two": 1,
-            "3": 2, "third": 2, "three": 2,
-        }
+        # Ordinals checked before cardinals to avoid "one" matching inside "second one"
+        number_map = [
+            ("first",  0), ("second", 1), ("third",  2),
+            (r"\b1\b", 0), (r"\b2\b", 1), (r"\b3\b", 2),
+            (r"\bone\b", 0), (r"\btwo\b", 1), (r"\bthree\b", 2),
+        ]
         chosen = None
-        for word, idx in number_map.items():
-            if word in text_lower:
+        for pattern, idx in number_map:
+            if _re.search(pattern, text_lower):
                 if idx < len(merchants):
                     chosen = merchants[idx]
                     break
@@ -386,6 +393,11 @@ def handle_order_flow(entities: dict, raw_text: str, dm_state) -> dict:
     # ── Fresh search ──────────────────────────────────────────────────────────
     query = (entities.get("merchant") or entities.get("item") or
              entities.get("query") or raw_text)
+
+    # Stash remaining items from compound orders ("2 coffees and 2 pizzas")
+    multi_items = entities.get("multi_items", [])
+    if len(multi_items) > 1 and not dm_state.pending_entities.get("pending_order_queue"):
+        dm_state.pending_entities["pending_order_queue"] = multi_items[1:]
 
     if COMMERCE_AVAILABLE:
         result = search_merchants(query)
@@ -619,6 +631,22 @@ class DialogueManager:
         if any(w in text_lower for w in ["him", "her", "them"]) and last_contacts:
             text = re.sub(r"\b(him|her|them)\b", last_contacts[-1],
                           text, flags=re.IGNORECASE)
+        # Vehicle control context: resolve "both"/"them"/"those" → last acted components
+        if self.state.last_vehicle_components:
+            comps = self.state.last_vehicle_components
+            comp_str = " and ".join(comps)
+            if any(w in text_lower for w in ["both", "those", "all of them", "all of those"]):
+                text = re.sub(r"\b(both|those|all of them|all of those)\b",
+                              comp_str, text, flags=re.IGNORECASE)
+            elif "them" in text_lower and not last_contacts:
+                text = re.sub(r"\bthem\b", comp_str, text, flags=re.IGNORECASE)
+            elif len(comps) == 1 and any(w in text_lower for w in ["it", "that"]):
+                # Don't expand "it"/"that" when the clause is a value-setting command
+                # e.g. "set it to 10c" / "put it on 20 degrees" — "it" refers to a value, not component
+                import re as _re
+                is_value_setting = bool(_re.search(r"set\s+\w+\s+to\s+\d|to\s+\d+\s*(?:c\b|degrees?)", text_lower))
+                if not is_value_setting:
+                    text = re.sub(r"\b(it|that)\b", comps[0], text, flags=re.IGNORECASE)
         return text
 
     def _check_missing_slots(self, intent: str, entities: dict) -> list:
@@ -722,6 +750,21 @@ class DialogueManager:
                 message="Stopped. Buffer and queue cleared. Ready for commands.",
                 state="IDLE", intent="stop",
                 routing="Interrupt — immediate halt — buffer + queue flushed"
+            ))
+
+        # ── Greeting (explicit "hi"/"hey"/"hello") ─────────────────────────
+        _greeting_words = {"hey", "hello", "hi", "good morning", "good evening",
+                           "good afternoon", "hey there", "hi there", "howdy", "hey nova",
+                           "hi nova", "hello nova"}
+        # Only match when the *entire* utterance is a greeting — no startswith()
+        # because "Hey turn on the AC." starts with "hey " and would be swallowed.
+        if text_lower.strip().rstrip(".,!?") in _greeting_words:
+            greeting = get_greeting(self._profile, self._driver_id)
+            self._add_to_history("user", user_input, "greeting")
+            return self._store_response(build_response(
+                message=greeting,
+                state="IDLE", intent="greeting",
+                routing="Greeting detected — profile-based response (no LLM)"
             ))
 
         # ── Repeat ────────────────────────────────────────────────────────────
@@ -892,6 +935,12 @@ class DialogueManager:
     # ── Route ─────────────────────────────────────────────────────────────────
     def _route(self, result: IntentResult) -> dict:
         if result.intent == "vehicle_control":
+            # Track which components were just acted on for context resolution
+            commands = result.entities.get("commands")
+            if commands and len(commands) > 1:
+                self.state.last_vehicle_components = [c["component"] for c in commands if c.get("component")]
+            elif result.entities.get("component"):
+                self.state.last_vehicle_components = [result.entities["component"]]
             return handle_vehicle_control(result.entities)
         elif result.intent == "navigation":
             return handle_navigation(result.entities)
@@ -1227,11 +1276,13 @@ class DialogueManager:
         self.state.fsm_state = "IDLE"
         entities = self.state.pending_entities
 
+        # Grab compound order queue before we clear pending_entities
+        pending_order_queue = list(entities.get("pending_order_queue") or [])
+
         # Start a simulated session when payment completes (tracks expiry)
         if not self.state.session_start:
             self._start_session(f"web_session_{int(time.time())}")
 
-        
         current_orders = (self._profile or {}).get("total_orders", 0)
         new_orders = current_orders + 1
         if self._profile is not None:
@@ -1249,32 +1300,51 @@ class DialogueManager:
 
         if COMMERCE_AVAILABLE and entities.get("basket_id"):
             result = process_payment(entities["basket_id"], entities)
+            payment_msg = result["nova_says"]
+            payment_entities = {
+                "order_id":         result["order_id"],
+                "transaction_id":   result["transaction_id"],
+                "merchant_name":    result["merchant_name"],
+                "merchant_address": result["merchant_address"],
+                "items":            result["items"],
+                "total":            result["total"],
+                "nova_fee":         result["nova_fee"],
+                "eta_order":        result["eta_order"],
+                "payment_method":   result["payment_method"],
+                "lat":              entities.get("lat"),
+                "lng":              entities.get("lng")
+            }
+        else:
+            payment_msg = "OTP verified. Order confirmed. $6.50 charged via Nova Pay. Ready in 8 minutes."
+            payment_entities = {"transaction_id": "TXN-DEMO001", "nova_fee": 0.20}
+
+        # If there are more items in a compound order, chain the next one
+        if pending_order_queue:
+            next_item = pending_order_queue[0]
+            remaining  = pending_order_queue[1:]
+            self.state.pending_entities = {}
+            next_entities = {
+                "item":     next_item["item"],
+                "quantity": next_item.get("quantity", 1),
+            }
+            if remaining:
+                next_entities["pending_order_queue"] = remaining
+            next_response = handle_order_flow(next_entities, next_item["item"], self.state)
+            combined_msg = f"{payment_msg} Now ordering your {next_item['item']}. {next_response['message']}"
             return build_response(
-                message=result["nova_says"],
-                state="IDLE", intent="payment",
-                routing="Nova Pay — Stripe test mode — transaction complete",
-                action="payment_confirmed",
-                entities={
-                    "order_id":         result["order_id"],
-                    "transaction_id":   result["transaction_id"],
-                    "merchant_name":    result["merchant_name"],
-                    "merchant_address": result["merchant_address"],
-                    "items":            result["items"],
-                    "total":            result["total"],
-                    "nova_fee":         result["nova_fee"],
-                    "eta_order":        result["eta_order"],
-                    "payment_method":   result["payment_method"],
-                    "lat":              entities.get("lat"),
-                    "lng":              entities.get("lng")
-                }
+                message=combined_msg,
+                state=next_response["state"], intent="payment",
+                routing="Nova Pay — compound order chained",
+                action=next_response.get("action", "payment_confirmed"),
+                entities={**payment_entities, **self.state.pending_entities}
             )
 
         return build_response(
-            message="OTP verified. Order confirmed. $6.50 charged via Nova Pay. Ready in 8 minutes.",
+            message=payment_msg,
             state="IDLE", intent="payment",
-            routing="Nova Pay — transaction complete",
+            routing="Nova Pay — Stripe test mode — transaction complete",
             action="payment_confirmed",
-            entities={"transaction_id": "TXN-DEMO001", "nova_fee": 0.20}
+            entities=payment_entities
         )
 
 

@@ -42,7 +42,7 @@ def extract_entities(text: str, intent: str) -> dict:
 
     if intent == "navigation":
         dest_match = re.search(
-            r"(?:go to|navigate to|take me to|drive to|head to|route to|directions? to)\s+(.+)",
+            r"(?:go to|navigate to|take me to|get me to|drive to|head to|route to|directions? to)\s+(.+)",
             text_lower
         )
         if dest_match:
@@ -54,6 +54,7 @@ def extract_entities(text: str, intent: str) -> dict:
         controls = ["ac", "window", "sunroof", "heater", "fan",
                     "lights", "light", "seat", "wiper", "horn", "defrost"]
         component_aliases = {"roof": "sunroof", "a/c": "ac", "air conditioning": "ac",
+                             "air condition": "ac", "temperature": "ac",
                              "sound roof": "sunroof", "sun roof": "sunroof", "dac": "ac"}
 
         # Split on " and " to handle compound commands like
@@ -61,6 +62,7 @@ def extract_entities(text: str, intent: str) -> dict:
         clauses = [c.strip() for c in re.split(r'\band\b', text_lower) if c.strip()]
 
         all_commands = []
+        last_action = None  # carry forward action across compound clauses
         for clause in clauses:
             comp = None
             for control in controls:
@@ -82,7 +84,8 @@ def extract_entities(text: str, intent: str) -> dict:
                                            "switch", "turn"]):
                 action = "on"
             else:
-                action = "on"  # default
+                action = last_action or "on"  # inherit from previous clause
+            last_action = action
             all_commands.append({"component": comp, "action": action})
 
         if all_commands:
@@ -91,6 +94,30 @@ def extract_entities(text: str, intent: str) -> dict:
             entities["action"] = all_commands[0]["action"]
             if len(all_commands) > 1:
                 entities["commands"] = all_commands
+
+        # Temperature extraction: "set it to 10c", "20 degrees"
+        temp_match = re.search(r"(\d+)\s*(?:c\b|°c|degrees?(?:\s+celsius)?)", text_lower)
+        if temp_match:
+            temp_c = int(temp_match.group(1))
+            entities["temperature_c"] = temp_c
+            if temp_c <= 16:
+                entities["ac_temp_range"] = "cold"
+            elif temp_c <= 22:
+                entities["ac_temp_range"] = "mid-cold"
+            else:
+                entities["ac_temp_range"] = "normal"
+
+        # Fan speed extraction
+        if re.search(r"(?:fan|air).*?(?:to\s+)?(low|slow)\b", text_lower):
+            entities["fan_speed"] = "low"
+        elif re.search(r"(?:fan|air).*?(?:to\s+)?(medium|mid|moderate)\b", text_lower):
+            entities["fan_speed"] = "medium"
+        elif re.search(r"(?:fan|air).*?(?:to\s+)?(high|fast|full|max)\b", text_lower):
+            entities["fan_speed"] = "high"
+        elif re.search(r"(?:increase|raise|boost|turn up).*?(?:the\s+)?(?:fan|air)", text_lower):
+            entities["fan_speed"] = "high"
+        elif re.search(r"(?:decrease|lower|reduce|turn down).*?(?:the\s+)?(?:fan|air)", text_lower):
+            entities["fan_speed"] = "low"
 
     if intent == "media":
         play_match = re.search(r"play\s+(.+)", text_lower)
@@ -130,6 +157,29 @@ def extract_entities(text: str, intent: str) -> dict:
             )
             if item_match:
                 entities["item"] = item_match.group(1).strip()
+
+        # Compound order detection: "2 coffees and 2 pizzas"
+        compound_clauses = [c.strip() for c in re.split(r'\band\b', text_lower) if c.strip()]
+        if len(compound_clauses) > 1:
+            multi_items = []
+            for clause in compound_clauses:
+                qty = 1
+                qty_m = re.search(r"\b(one|two|three|four|five|a|an|\d+)\b", clause)
+                if qty_m:
+                    w = qty_m.group(1)
+                    qty = quantity_map.get(w, int(w) if w.isdigit() else 1)
+                item_found = None
+                for it in sorted(KNOWN_ITEMS, key=len, reverse=True):
+                    if it in clause:
+                        item_found = it
+                        break
+                if item_found:
+                    multi_items.append({"item": item_found, "quantity": min(qty, 10)})
+            if len(multi_items) > 1:
+                entities["multi_items"] = multi_items
+                # Override with first compound item
+                entities["item"]     = multi_items[0]["item"]
+                entities["quantity"] = multi_items[0]["quantity"]
 
         dollar_match = re.search(r"\$\s*(\d+(?:\.\d{1,2})?)", text_lower)
         if dollar_match:
@@ -241,7 +291,7 @@ class IntentClassifier:
 
         # 1b. Vehicle control keyword override (reliable, no ML needed)
         _vc_components = ["ac", "dac", "heater", "fan", "window", "wiper", "horn",
-                          "lights", "light", "seat", "sunroof", "sun roof",
+                          "lights", "light", "seat", "sunroof", "sun roof", "roof",
                           "sound roof", "defrost", "air conditioning", "temperature"]
         _vc_action_words = ["on", "off", "open", "close", "up", "down",
                             "increase", "decrease", "higher", "lower",
@@ -255,12 +305,29 @@ class IntentClassifier:
                                     entities=entities, raw_text=text)
 
         # 1c. Navigation keyword override
-        _nav_triggers = ["navigate", "go to", "take me to", "drive to",
+        _nav_triggers = ["navigate", "go to", "take me to", "get me to", "drive to",
                          "route to", "directions to", "head to", "how do i get to"]
         if any(t in text_clean for t in _nav_triggers):
             entities = extract_entities(text, "navigation")
             return IntentResult(intent="navigation", confidence=0.95,
                                 entities=entities, raw_text=text)
+
+        # 1d. Implicit comfort/state phrases → vehicle control (no component keyword needed)
+        _comfort_map = [
+            (["i'm cold", "im cold", "i am cold", "it's cold", "its cold",
+              "too cold", "feeling cold", "so cold", "freezing"],
+             {"component": "heater", "action": "on"}),
+            (["i'm hot", "im hot", "i am hot", "it's hot", "its hot",
+              "too hot", "feeling hot", "so hot", "getting warm",
+              "it's warm", "its warm", "too warm", "sweating"],
+             {"component": "ac", "action": "on"}),
+            (["stuffy", "need fresh air", "hard to breathe", "need some air"],
+             {"component": "ac", "action": "on"}),
+        ]
+        for phrases, entities in _comfort_map:
+            if any(p in text_clean for p in phrases):
+                return IntentResult(intent="vehicle_control", confidence=0.88,
+                                    entities=entities, raw_text=text)
 
         if not self.recognizer:
             # Fallback to general question if ML fails
