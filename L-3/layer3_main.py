@@ -296,7 +296,7 @@ def authorize_payment(
     """
     if verbose:
         print(f"\n  {'═'*55}")
-        print(f"  💳 PAYMENT AUTHORIZATION")
+        print("  💳 PAYMENT AUTHORIZATION")
         print(f"  Amount   : Rs {amount}")
         print(f"  Merchant : {merchant}")
         print(f"  {'═'*55}")
@@ -306,7 +306,7 @@ def authorize_payment(
 
     if not session["valid"]:
         if verbose:
-            print(f"\n  ⚠️  Session expired. Re-verifying at payment threshold (0.92)...")
+            print("\n  ⚠️  Session expired. Re-verifying at payment threshold (0.92)...")
 
         # Re-verify at stricter threshold
         result = verify_for_payment(driver_id, verbose=verbose)

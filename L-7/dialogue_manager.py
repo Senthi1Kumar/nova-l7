@@ -223,7 +223,7 @@ REQUIRED_SLOTS = {
 SLOT_QUESTIONS = {
     "destination": "Where would you like to go?",
     "contact":     "Who would you like to call or message?",
-    "component":   "Which component — AC, window, heater, sunroof, or lights?",
+    "component":   "Which component — AC, window, heater, sunroof, lights, or rear camera?",
     "action":      "Should I turn it on or off?",
 }
 
@@ -249,16 +249,25 @@ NUMBER_WORDS = {
 
 
 # ── Route handlers ────────────────────────────────────────────────────────────
+# TTS-friendly display names for vehicle components
+_COMPONENT_DISPLAY = {
+    "ac": "A C", "rear_camera": "rear camera", "rear camera": "rear camera",
+}
+
+def _tts_component(name: str) -> str:
+    """Return a TTS-friendly display name for a vehicle component."""
+    return _COMPONENT_DISPLAY.get(name, name.capitalize())
+
 def handle_vehicle_control(entities: dict) -> dict:
     commands = entities.get("commands")
     if commands and len(commands) > 1:
         # Compound command: "switch off the AC and open the sunroof"
-        parts = [f"{c['component'].upper()} turned {c['action']}" for c in commands]
+        parts = [f"{_tts_component(c['component'])} turned {c['action']}" for c in commands]
         message = "Done. " + ", ".join(parts) + "."
     else:
         component = entities.get("component", "system")
         action    = entities.get("action", "on")
-        message = f"Done. {component.upper()} turned {action}."
+        message = f"Done. {_tts_component(component)} turned {action}."
     if entities.get("temperature_c"):
         message += f" Temperature set to {entities['temperature_c']}°C."
     if entities.get("fan_speed"):
@@ -292,7 +301,7 @@ def handle_media(entities: dict) -> dict:
 
 def handle_general_question(text: str, history: list) -> dict:
     return build_response(
-        message=f"Let me think about that...",
+        message="Let me think about that...",
         state="IDLE", intent="general_question",
         routing="Local LLM with context",
         entities={}, action="llm_call",
@@ -1097,6 +1106,47 @@ class DialogueManager:
             response["verification_status"] = "passed"
             return response
 
+    @staticmethod
+    def _normalize_slot_value(slot: str, raw_input: str) -> str | None:
+        """Extract a canonical slot value from the user's free-form response.
+
+        Returns None if the input cannot be mapped to a valid value
+        (caller should re-ask).
+        """
+        text = raw_input.lower().strip()
+
+        if slot == "action":
+            if any(w in text for w in ["off", "close", "shut", "disable"]):
+                return "off"
+            if any(w in text for w in ["on", "open", "start", "enable", "yes", "switch", "turn"]):
+                return "on"
+            return None
+
+        if slot == "component":
+            controls = [
+                "ac", "window", "sunroof", "heater", "fan",
+                "lights", "light", "seat", "wiper", "horn",
+                "defrost", "camera", "rear camera", "rear_camera",
+            ]
+            aliases = {
+                "roof": "sunroof", "a/c": "ac", "air conditioning": "ac",
+                "air conditioner": "ac", "air condition": "ac",
+                "temperature": "ac", "sound roof": "sunroof",
+                "sun roof": "sunroof", "dac": "ac",
+                "backup camera": "rear_camera", "back camera": "rear_camera",
+                "reverse camera": "rear_camera",
+            }
+            for alias, canonical in aliases.items():
+                if alias in text:
+                    return canonical
+            for ctrl in controls:
+                if ctrl in text:
+                    return ctrl
+            return None
+
+        # destination, contact, etc. — keep the raw input
+        return raw_input.strip()
+
     def _handle_slot_fill(self, user_input: str) -> dict:
         self.state.slot_attempt += 1
         if self.state.slot_attempt > 3:
@@ -1108,7 +1158,21 @@ class DialogueManager:
                 routing="Slot fill failed after 3 attempts"
             )
         missing_slot = self.state.missing_slots[0]
-        self.state.pending_entities[missing_slot] = user_input
+
+        # Normalize the raw input into a canonical value for this slot
+        value = self._normalize_slot_value(missing_slot, user_input)
+        if value is None:
+            # Could not parse — re-ask the same slot
+            question = SLOT_QUESTIONS.get(missing_slot,
+                                          f"What is the {missing_slot}?")
+            return build_response(
+                message=f"Sorry, I didn't catch that. {question}",
+                state="SLOT_FILL", intent=self.state.current_intent,
+                routing=f"Slot fill — could not parse '{user_input}' for {missing_slot}",
+                entities=self.state.pending_entities
+            )
+
+        self.state.pending_entities[missing_slot] = value
         self.state.missing_slots.pop(0)
         if self.state.missing_slots:
             question = SLOT_QUESTIONS.get(self.state.missing_slots[0],

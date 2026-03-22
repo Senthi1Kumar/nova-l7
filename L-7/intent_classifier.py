@@ -52,10 +52,14 @@ def extract_entities(text: str, intent: str) -> dict:
 
     if intent == "vehicle_control":
         controls = ["ac", "window", "sunroof", "heater", "fan",
-                    "lights", "light", "seat", "wiper", "horn", "defrost"]
+                    "lights", "light", "seat", "wiper", "horn", "defrost",
+                    "camera", "rear camera", "rear_camera"]
         component_aliases = {"roof": "sunroof", "a/c": "ac", "air conditioning": "ac",
-                             "air condition": "ac", "temperature": "ac",
-                             "sound roof": "sunroof", "sun roof": "sunroof", "dac": "ac"}
+                             "air conditioner": "ac", "air condition": "ac", "temperature": "ac",
+                             "sound roof": "sunroof", "sun roof": "sunroof", "dac": "ac",
+                             "camera": "rear_camera", "rear camera": "rear_camera",
+                             "backup camera": "rear_camera", "back camera": "rear_camera",
+                             "reverse camera": "rear_camera"}
 
         # Split on " and " to handle compound commands like
         # "switch off the AC and open the sunroof"
@@ -100,12 +104,17 @@ def extract_entities(text: str, intent: str) -> dict:
         if temp_match:
             temp_c = int(temp_match.group(1))
             entities["temperature_c"] = temp_c
-            if temp_c <= 16:
-                entities["ac_temp_range"] = "cold"
+            if temp_c <= 18:
+                entities["ac_temp_range"] = "cold"    # ≤18°C max AC / ice cold
             elif temp_c <= 22:
-                entities["ac_temp_range"] = "mid-cold"
+                entities["ac_temp_range"] = "mid"     # 19–22°C comfort zone
             else:
-                entities["ac_temp_range"] = "normal"
+                entities["ac_temp_range"] = "hot"     # ≥23°C warm/heat territory
+        # If temperature extracted but no component resolved, default to AC
+        if entities.get("temperature_c") and not entities.get("component"):
+            entities["component"] = "ac"
+            if not entities.get("action"):
+                entities["action"] = "on"
 
         # Fan speed extraction
         if re.search(r"(?:fan|air).*?(?:to\s+)?(low|slow)\b", text_lower):
@@ -292,13 +301,17 @@ class IntentClassifier:
         # 1b. Vehicle control keyword override (reliable, no ML needed)
         _vc_components = ["ac", "dac", "heater", "fan", "window", "wiper", "horn",
                           "lights", "light", "seat", "sunroof", "sun roof", "roof",
-                          "sound roof", "defrost", "air conditioning", "temperature"]
+                          "sound roof", "defrost", "air conditioning", "air conditioner", "temperature",
+                          "camera", "rear camera", "backup camera", "reverse camera"]
         _vc_action_words = ["on", "off", "open", "close", "up", "down",
                             "increase", "decrease", "higher", "lower",
                             "switch", "turn", "adjust", "set"]
         _has_component = any(c in text_clean for c in _vc_components)
         _has_action    = any(a in text_clean for a in _vc_action_words)
-        if _has_component and _has_action:
+        _question_words = ["what", "how", "is", "are", "check", "status", "show", "tell"]
+        _bare_component = (len(text_clean.split()) <= 2
+                           and not any(q in text_clean for q in _question_words))
+        if _has_component and (_has_action or _bare_component):
             entities = extract_entities(text, "vehicle_control")
             if entities.get("component"):
                 return IntentResult(intent="vehicle_control", confidence=0.95,
@@ -315,19 +328,30 @@ class IntentClassifier:
         # 1d. Implicit comfort/state phrases → vehicle control (no component keyword needed)
         _comfort_map = [
             (["i'm cold", "im cold", "i am cold", "it's cold", "its cold",
-              "too cold", "feeling cold", "so cold", "freezing"],
+              "too cold", "feeling cold", "so cold", "freezing",
+              "very cold", "bit cold", "quite cold", "pretty cold",
+              "getting cold", "cold in here", "chilly", "i feel cold",
+              "it feels cold", "so chilly", "really cold"],
              {"component": "heater", "action": "on"}),
             (["i'm hot", "im hot", "i am hot", "it's hot", "its hot",
               "too hot", "feeling hot", "so hot", "getting warm",
-              "it's warm", "its warm", "too warm", "sweating"],
+              "it's warm", "its warm", "too warm", "sweating",
+              "very hot", "really hot", "burning up", "boiling",
+              "roasting", "hot in here", "i feel hot", "it feels hot"],
              {"component": "ac", "action": "on"}),
-            (["stuffy", "need fresh air", "hard to breathe", "need some air"],
+            (["stuffy", "need fresh air", "hard to breathe", "need some air",
+              "can't breathe", "no air"],
              {"component": "ac", "action": "on"}),
         ]
         for phrases, entities in _comfort_map:
             if any(p in text_clean for p in phrases):
                 return IntentResult(intent="vehicle_control", confidence=0.88,
                                     entities=entities, raw_text=text)
+
+        # 1e. Bare temperature value commands → AC climate control
+        #     e.g. "increase to 15 degrees", "set to 22c", "make it 20 celsius"
+        if re.search(r"\b\d+\s*(?:c\b|°c|degrees?(?:\s+celsius)?)\b", text_clean):
+            return IntentResult(intent="vehicle_control", confidence=0.87, entities={}, raw_text=text)
 
         if not self.recognizer:
             # Fallback to general question if ML fails
