@@ -223,7 +223,7 @@ REQUIRED_SLOTS = {
 SLOT_QUESTIONS = {
     "destination": "Where would you like to go?",
     "contact":     "Who would you like to call or message?",
-    "component":   "Which component — AC, window, heater, sunroof, lights, or rear camera?",
+    "component":   "Which component — AC, window, heater, sunroof, or lights?",
     "action":      "Should I turn it on or off?",
 }
 
