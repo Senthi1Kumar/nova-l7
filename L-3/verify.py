@@ -130,6 +130,10 @@ def get_model():
     return _model_cache
 
 
+def preload():
+    """Pre-load ECAPA-TDNN so first verification is fast."""
+    get_model()
+
 def extract_live_fingerprint(wav_path: Path) -> np.ndarray:
     """
     Extract voice fingerprint from a WAV file.

@@ -925,6 +925,14 @@ class DialogueManager:
             if warning:
                 print(f"[dialogue] Session warning: {warning}")
 
+        # Default action for vehicle_control — if component is clear but action
+        # wasn't extracted (e.g. STT dropped "open"/"close"), default to "on"
+        # rather than asking "Should I turn it on or off?"
+        if (result.intent == "vehicle_control"
+                and result.entities.get("component")
+                and not result.entities.get("action")):
+            result.entities["action"] = "on"
+
         missing = self._check_missing_slots(result.intent, result.entities)
         if missing:
             self.state.fsm_state        = "SLOT_FILL"
