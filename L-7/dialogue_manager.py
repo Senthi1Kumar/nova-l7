@@ -846,7 +846,15 @@ class DialogueManager:
 
         # ── FSM states ────────────────────────────────────────────────────────
         if self.state.fsm_state == "SLOT_FILL":
-            return self._store_response(self._handle_slot_fill(user_input))
+            if self._should_escape_slot_fill(user_input):
+                # User switched topic — reset and fall through to normal routing
+                self.state.fsm_state = "IDLE"
+                self.state.current_intent = None
+                self.state.missing_slots = []
+                self.state.pending_entities = {}
+                self.state.slot_attempt = 0
+            else:
+                return self._store_response(self._handle_slot_fill(user_input))
 
         if self.state.fsm_state == "CONFIRM_PENDING":
             return self._store_response(self._handle_confirmation(user_input))
@@ -1115,13 +1123,28 @@ class DialogueManager:
             return response
 
     @staticmethod
+    def _should_escape_slot_fill(user_input: str) -> bool:
+        """Return True if the input looks like a new intent rather than a slot answer."""
+        text = user_input.lower().strip()
+        if any(w in text for w in ["cancel", "never mind", "nevermind", "forget it", "stop", "abort"]):
+            return True
+        if "?" in user_input:
+            return True
+        if len(user_input.split()) > 6:
+            return True
+        return False
+
+    @staticmethod
     def _normalize_slot_value(slot: str, raw_input: str) -> str | None:
         """Extract a canonical slot value from the user's free-form response.
 
         Returns None if the input cannot be mapped to a valid value
         (caller should re-ask).
         """
+        import re as _re
         text = raw_input.lower().strip()
+        # Normalize spaced/dotted initials: "a. c." → "ac", "a.c." → "ac"
+        text = _re.sub(r'\b([a-z])\.\s*([a-z])\.?\s*\b', r'\1\2', text)
 
         if slot == "action":
             if any(w in text for w in ["off", "close", "shut", "disable"]):
