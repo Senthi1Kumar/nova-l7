@@ -15,6 +15,7 @@ AGREED FLOW:
 
 from intent_classifier import IntentClassifier, IntentResult
 from dataclasses import dataclass, field
+from collections import deque
 from typing import Optional
 import time
 import random
@@ -112,7 +113,8 @@ class DialogueState:
     last_vehicle_components: list = field(default_factory=list)
 
     # FIFO buffer
-    command_buffer: list = field(default_factory=list)
+    command_buffer: list  = field(default_factory=list)
+    intent_queue:   deque = field(default_factory=deque)
     is_speaking: bool = False
     greeted: bool = False
 
@@ -226,6 +228,31 @@ SLOT_QUESTIONS = {
     "component":   "Which component — AC, window, heater, sunroof, or lights?",
     "action":      "Should I turn it on or off?",
 }
+
+# ── Compound intent dispatcher constants ──────────────────────────────────────
+INTENT_PRIORITY: dict = {
+    "emergency":        0,
+    "stop":             1,
+    "vehicle_control":  2,   # instant CAN bus — unblocks everything fast
+    "navigation":       3,
+    "payment":          4,
+    "media":            5,
+    "communication":    6,
+    "general_question": 7,
+}
+
+INTENT_LABELS: dict = {
+    "vehicle_control":  "vehicle control",
+    "payment":          "your order",
+    "navigation":       "navigation",
+    "media":            "media",
+    "communication":    "communication",
+    "general_question": "your question",
+}
+
+MUTUALLY_EXCLUSIVE_COMPONENTS: list = [
+    {"ac", "heater"},
+]
 
 # ── Keyword groups ────────────────────────────────────────────────────────────
 EMERGENCY_KEYWORDS = ["emergency", "accident", "help me", "call 911", "call ambulance"]
@@ -546,7 +573,16 @@ class DialogueManager:
             if self.state.command_buffer:
                 response["nova_says"] += f" ({len(self.state.command_buffer)} more in queue)"
             return response
-        print("[dialogue] Buffer empty — returning to IDLE")
+        if self.state.intent_queue:
+            queued = self.state.intent_queue.popleft()
+            print(f"[dialogue] Draining intent queue — next: {queued.intent}")
+            response = self._route(queued)
+            if self.state.intent_queue:
+                remaining = [INTENT_LABELS.get(r.intent, r.intent) for r in self.state.intent_queue]
+                response["nova_says"] += f" ({', '.join(remaining)} still queued)"
+            response["from_intent_queue"] = True
+            return response
+        print("[dialogue] Buffer and queue empty — returning to IDLE")
         return None
 
     def _push_to_buffer(self, text: str) -> dict:
@@ -733,6 +769,7 @@ class DialogueManager:
         if any(kw in text_lower for kw in EMERGENCY_KEYWORDS):
             self.state.is_speaking    = False
             self.state.command_buffer.clear()
+            self.state.intent_queue.clear()
             self.state.fsm_state      = "IDLE"
             self.state.current_intent = None
             self._otp_active          = None
@@ -748,6 +785,7 @@ class DialogueManager:
         if any(kw in text_lower for kw in STOP_KEYWORDS):
             self.state.is_speaking    = False
             self.state.command_buffer.clear()
+            self.state.intent_queue.clear()
             self.state.fsm_state      = "IDLE"
             self.state.current_intent = None
             self._otp_active          = None
@@ -917,7 +955,24 @@ class DialogueManager:
                     routing="No usual order found"
                 ))
         resolved_text = self._resolve_context(user_input)
-        result        = self.classifier.classify(resolved_text)
+
+        # ── Compound gate ─────────────────────────────────────────────────────
+        all_results = self.classifier.split_and_classify(resolved_text)
+
+        if len(all_results) > 1:
+            # Sort by priority; lower number = higher priority
+            all_results.sort(key=lambda r: INTENT_PRIORITY.get(r.intent, 99))
+            result = all_results[0]
+            secondary = all_results[1:QUEUE_MAX + 1]
+            self.state.intent_queue.clear()
+            self.state.intent_queue.extend(secondary)
+            # Build queue note for appending to primary response
+            labels = [INTENT_LABELS.get(r.intent, r.intent) for r in secondary]
+            _queue_note = f" I've queued {', '.join(labels)} for after."
+        else:
+            result = all_results[0]
+            _queue_note = ""
+
         self._add_to_history("user", user_input, result.intent)
 
         _log_command(
@@ -950,20 +1005,42 @@ class DialogueManager:
             self.state.slot_attempt     = 0
             question = SLOT_QUESTIONS.get(missing[0], f"What is the {missing[0]}?")
             return self._store_response(build_response(
-                message=question, state="SLOT_FILL", intent=result.intent,
+                message=question + _queue_note, state="SLOT_FILL", intent=result.intent,
                 routing=f"Slot filling — missing: {missing}",
                 entities=result.entities
             ))
 
-        return self._store_response(self._route(result))
+        response = self._route(result)
+        if _queue_note:
+            response["nova_says"] = response.get("nova_says", "") + _queue_note
+        return self._store_response(response)
 
     # ── Route ─────────────────────────────────────────────────────────────────
     def _route(self, result: IntentResult) -> dict:
         if result.intent == "vehicle_control":
-            # Track which components were just acted on for context resolution
             commands = result.entities.get("commands")
             if commands and len(commands) > 1:
-                self.state.last_vehicle_components = [c["component"] for c in commands if c.get("component")]
+                # Check for mutually exclusive components both turned ON
+                active_on = {c["component"] for c in commands if c.get("action") == "on"}
+                for exclusive_set in MUTUALLY_EXCLUSIVE_COMPONENTS:
+                    conflict = active_on & exclusive_set
+                    if len(conflict) > 1:
+                        names = " and ".join(
+                            _tts_component(c) for c in sorted(conflict)
+                        )
+                        self.state.fsm_state        = "SLOT_FILL"
+                        self.state.current_intent   = "vehicle_control"
+                        self.state.pending_entities = result.entities
+                        self.state.missing_slots    = ["component_choice"]
+                        return build_response(
+                            message=f"{names} can't run together — which one do you want?",
+                            state="SLOT_FILL", intent="vehicle_control",
+                            routing="Conflict resolution — mutually exclusive components",
+                            entities=result.entities, action="clarify_conflict"
+                        )
+                self.state.last_vehicle_components = [
+                    c["component"] for c in commands if c.get("component")
+                ]
             elif result.entities.get("component"):
                 self.state.last_vehicle_components = [result.entities["component"]]
             return handle_vehicle_control(result.entities)

@@ -9,6 +9,66 @@ from dataclasses import dataclass
 
 logger = logging.getLogger("IntentClassifier")
 
+# ── Compound intent detection ─────────────────────────────────────────────────
+
+@dataclass
+class CompoundCheck:
+    is_compound: bool
+    categories:  list   # list[str] — intent categories detected
+    segments:    list   # list[str] — populated by CompoundSplitter, empty here
+
+
+COMPOUND_SIGNALS: dict = {
+    "vehicle_control": ["ac", "heater", "fan", "window", "sunroof", "lights",
+                        "seat", "wiper", "cold", "hot", "warm", "stuffy"],
+    "payment":         ["order", "coffee", "burger", "pizza", "buy", "want",
+                        "get me", "latte", "food"],
+    "navigation":      ["navigate", "go to", "take me", "directions", "route"],
+    "media":           ["play", "music", "song", "playlist", "pause", "skip"],
+    "communication":   ["call", "text", "message", "email", "send", "whatsapp"],
+    "general_question":["what", "who", "how", "news", "weather", "tell me"],
+}
+
+
+class CompoundDetector:
+    """Fast keyword scan — runs before any ML classification (~0.1ms)."""
+
+    def check(self, text: str) -> CompoundCheck:
+        text_lower = text.lower()
+        detected = [
+            cat for cat, signals in COMPOUND_SIGNALS.items()
+            if any(s in text_lower for s in signals)
+        ]
+        return CompoundCheck(
+            is_compound=len(detected) >= 2,
+            categories=detected,
+            segments=[],
+        )
+
+
+class CompoundSplitter:
+    """
+    Splits a compound utterance into segments at natural boundaries.
+    Delimiters are tried cumulatively — longest first to avoid splitting
+    inside single-intent clauses (e.g. "turn on AC and heater").
+    """
+    _DELIMITERS = [", ", ". ", " and also ", " then ", " also ", " and "]
+
+    def split(self, text: str, max_segments: int = 5) -> list:
+        segments = [text]
+        for delim in self._DELIMITERS:
+            new_segs = []
+            for seg in segments:
+                parts = re.split(re.escape(delim), seg, flags=re.IGNORECASE)
+                new_segs.extend(p.strip() for p in parts if p.strip())
+            segments = new_segs
+            if len(segments) >= max_segments:
+                break
+        return segments[:max_segments]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 @dataclass
 class IntentResult:
     intent: str          # what type of command
@@ -288,6 +348,29 @@ class IntentClassifier:
         except Exception as e:
             logger.error(f"Failed to initialize Moonshine IntentRecognizer: {e}")
             self.recognizer = None
+
+        self._detector = CompoundDetector()
+        self._splitter = CompoundSplitter()
+
+    def split_and_classify(self, text: str) -> list:
+        """
+        Returns a list of IntentResult.
+        Single-intent utterances return a one-element list (zero overhead).
+        Compound utterances are split, each segment classified, and unknown
+        segments are silently dropped.
+        """
+        check = self._detector.check(text)
+        if not check.is_compound:
+            return [self.classify(text)]
+
+        segments = self._splitter.split(text, max_segments=5)
+        results = [
+            self.classify(seg)
+            for seg in segments
+            if seg.strip()
+        ]
+        results = [r for r in results if r.intent != "unknown"]
+        return results if results else [self.classify(text)]
 
     def classify(self, text: str) -> IntentResult:
         if not text or not text.strip():
