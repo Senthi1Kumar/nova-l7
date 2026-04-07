@@ -77,6 +77,30 @@ def record_audio(duration: float = 3.0, sample_rate: int = 16000) -> np.ndarray:
     return np.concatenate(frames)
 
 
+def preprocess_audio(pcm_f32: np.ndarray) -> np.ndarray:
+    """
+    Match the preprocessing applied by stt_moonshine_worker before ECAPA-TDNN embedding.
+    Without this, enrollment embeddings are built from raw mic audio while verification
+    embeddings come from pre-emphasized + RMS-normalized audio, causing ~0.04 cosine
+    similarity drop that pushes scores below the 0.6 threshold.
+    """
+    _preemph_coeff = 0.97
+    _rms_target    = 0.08
+    _rms_floor     = 1e-6
+
+    # Pre-emphasis filter: y[n] = x[n] - coeff * x[n-1]
+    out = np.empty_like(pcm_f32)
+    out[0] = pcm_f32[0]
+    out[1:] = pcm_f32[1:] - _preemph_coeff * pcm_f32[:-1]
+
+    # RMS normalization
+    rms = np.sqrt(np.mean(out ** 2))
+    if rms > _rms_floor:
+        out = out * (_rms_target / rms)
+
+    return out
+
+
 def save_wav(audio: np.ndarray, filepath: Path, sample_rate: int = 16000) -> None:
     """Save numpy audio array as a WAV file."""
     import soundfile as sf
@@ -152,6 +176,7 @@ def enroll_voice(driver_id: str, num_samples: int = 5) -> bool:
         print(f"  🎙️  Recording... speak now")
 
         audio = record_audio(duration=3.0)
+        audio = preprocess_audio(audio)
         wav_path = temp_dir / f"{driver_id}_sample_{i}.wav"
         save_wav(audio, wav_path)
 

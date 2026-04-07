@@ -134,6 +134,25 @@ def preload():
     """Pre-load ECAPA-TDNN so first verification is fast."""
     get_model()
 
+def extract_fingerprint_from_array(audio_np: np.ndarray) -> np.ndarray:
+    """
+    Extract voice fingerprint directly from a float32 numpy array (16kHz mono).
+    Skips the file save/load round-trip for lower latency.
+    Returns normalized numpy array of shape (192,)
+    """
+    import torch
+
+    model = get_model()
+    waveform = torch.from_numpy(audio_np).unsqueeze(0)  # (1, samples)
+
+    with torch.no_grad():
+        embedding = model.encode_batch(waveform)
+
+    fingerprint = embedding.squeeze().cpu().numpy()
+    fingerprint = fingerprint / np.linalg.norm(fingerprint)
+    return fingerprint
+
+
 def extract_live_fingerprint(wav_path: Path) -> np.ndarray:
     """
     Extract voice fingerprint from a WAV file.
@@ -203,18 +222,15 @@ def verify_voice(driver_id: str,
 
     if audio_buffer is not None:
         if verbose: print("  [verify] Using provided audio buffer from pipeline")
-        wav_path = save_temp_wav(audio_buffer, f"{driver_id}_live")
+        if verbose: print("  [verify] Extracting live fingerprint...")
+        live_fp = extract_fingerprint_from_array(audio_buffer)
     else:
         if verbose: print("  [verify] Recording voice... speak now (2.5 sec)")
-        # Record live audio
         audio = record_live(duration=2.5)
         wav_path = save_temp_wav(audio, f"{driver_id}_live")
-
-    if verbose:
-        print("  [verify] Extracting live fingerprint...")
-
-    # Extract live fingerprint
-    live_fp = extract_live_fingerprint(wav_path)
+        if verbose: print("  [verify] Extracting live fingerprint...")
+        live_fp = extract_live_fingerprint(wav_path)
+        wav_path.unlink(missing_ok=True)
 
     if verbose:
         print("  [verify] Loading stored fingerprint...")
@@ -226,9 +242,6 @@ def verify_voice(driver_id: str,
     score = cosine_similarity(live_fp, stored_fp)
     passed = score >= threshold
     elapsed = int((time.time() - start_time) * 1000)
-
-    # Cleanup temp file
-    wav_path.unlink(missing_ok=True)
 
     result = {
         "passed":    passed,
