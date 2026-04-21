@@ -24,6 +24,36 @@ import argparse
 import numpy as np
 from pathlib import Path
 
+# Monkey-patch: torchaudio >=2.x removed list_audio_backends; SpeechBrain calls it on import.
+try:
+    import torchaudio as _ta
+    if not hasattr(_ta, "list_audio_backends"):
+        _ta.list_audio_backends = lambda: ["ffmpeg"]
+except Exception:
+    pass
+
+# Monkey-patch: speechbrain 1.0.x passes `use_auth_token` to hf_hub_download,
+# but huggingface_hub >=0.17 renamed it to `token` and removed the old kwarg.
+try:
+    import huggingface_hub as _hf
+    _orig_hf_download = _hf.hf_hub_download
+    def _patched_hf_download(*args, **kwargs):
+        if "use_auth_token" in kwargs:
+            kwargs["token"] = kwargs.pop("use_auth_token") or None
+        try:
+            return _orig_hf_download(*args, **kwargs)
+        except Exception as e:
+            filename = args[1] if len(args) > 1 else kwargs.get("filename", "")
+            is_404 = ("404" in str(e) or "Not Found" in str(e) or
+                      "EntryNotFound" in type(e).__name__ or
+                      "RemoteEntryNotFound" in type(e).__name__)
+            if "custom.py" in str(filename) and is_404:
+                raise ValueError("File not found on HF hub") from e
+            raise
+    _hf.hf_hub_download = _patched_hf_download
+except Exception:
+    pass
+
 # ── Local imports ──────────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent))
 from crypto_utils import save_array, encrypt_and_save

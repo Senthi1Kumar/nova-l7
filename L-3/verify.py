@@ -24,6 +24,14 @@ import time
 import numpy as np
 from pathlib import Path
 
+# Monkey-patch: torchaudio >=2.x removed list_audio_backends; SpeechBrain calls it on import.
+try:
+    import torchaudio as _ta
+    if not hasattr(_ta, "list_audio_backends"):
+        _ta.list_audio_backends = lambda: ["ffmpeg"]
+except Exception:
+    pass
+
 # Monkey-patch: speechbrain 1.0.x passes `use_auth_token` to hf_hub_download,
 # but huggingface_hub >=0.17 renamed it to `token` and removed the old kwarg.
 try:
@@ -55,6 +63,22 @@ except Exception:
 
 sys.path.insert(0, str(Path(__file__).parent))
 from crypto_utils import save_array, load_array
+
+
+def _preprocess_audio(pcm_f32: np.ndarray) -> np.ndarray:
+    """Pre-emphasis + RMS normalization — must match enroll.py pipeline."""
+    _preemph_coeff = 0.97
+    _rms_target    = 0.08
+    _rms_floor     = 1e-6
+
+    out = np.empty_like(pcm_f32)
+    out[0] = pcm_f32[0]
+    out[1:] = pcm_f32[1:] - _preemph_coeff * pcm_f32[:-1]
+
+    rms = np.sqrt(np.mean(out ** 2))
+    if rms > _rms_floor:
+        out = out * (_rms_target / rms)
+    return out
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 DATA_DIR         = Path(__file__).parent / "data"
@@ -221,14 +245,19 @@ def verify_voice(driver_id: str,
         }
 
     if audio_buffer is not None:
-        if verbose: print("  [verify] Using provided audio buffer from pipeline")
-        if verbose: print("  [verify] Extracting live fingerprint...")
-        live_fp = extract_fingerprint_from_array(audio_buffer)
+        if verbose:
+            print("  [verify] Using provided audio buffer from pipeline")
+        if verbose:
+            print("  [verify] Extracting live fingerprint...")
+        live_fp = extract_fingerprint_from_array(_preprocess_audio(audio_buffer))
     else:
-        if verbose: print("  [verify] Recording voice... speak now (2.5 sec)")
+        if verbose:
+            print("  [verify] Recording voice... speak now (2.5 sec)")
         audio = record_live(duration=2.5)
+        audio = _preprocess_audio(audio)
         wav_path = save_temp_wav(audio, f"{driver_id}_live")
-        if verbose: print("  [verify] Extracting live fingerprint...")
+        if verbose:
+            print("  [verify] Extracting live fingerprint...")
         live_fp = extract_live_fingerprint(wav_path)
         wav_path.unlink(missing_ok=True)
 
