@@ -525,7 +525,17 @@ def _log_command(driver_id: str, command: str, intent: str, is_verified: bool):
 class DialogueManager:
 
     def __init__(self):
-        self.classifier          = IntentClassifier()
+        _dm_mode = os.getenv("NOVA_DM_MODE", "regex").strip().lower()
+        if _dm_mode == "tool_calling":
+            try:
+                from llm_intent_classifier import LLMIntentClassifier
+                self.classifier = LLMIntentClassifier()
+                print("[Layer 7] Intent classifier: LLM tool-calling (OpenRouter)")
+            except Exception as e:
+                print(f"[Layer 7] LLMIntentClassifier init failed ({e}); falling back to regex.")
+                self.classifier = IntentClassifier()
+        else:
+            self.classifier = IntentClassifier()
         self.state               = DialogueState()
         self._otp_active         = None
         self._driver_id          = "driver1"
@@ -1199,8 +1209,34 @@ class DialogueManager:
             response["verification_status"] = "passed"
             return response
 
-    @staticmethod
-    def _should_escape_slot_fill(user_input: str) -> bool:
+    # Strong keywords that imply a fresh intent, not a slot answer.
+    # Keyed by current (in-progress) intent — we only escape when the user's
+    # input points at *something else*.
+    _CROSS_INTENT_KEYWORDS = {
+        "navigation": [
+            # payment / ordering
+            "order", "buy", "purchase", "pay", "pizza", "coffee", "food",
+            # comms
+            "call", "text", "message",
+            # vehicle control
+            "switch", "turn on", "turn off", "open the", "close the",
+            "ac", "heater", "sunroof", "window", "wiper",
+            # info
+            "weather", "news", "time", "temperature",
+        ],
+        "vehicle_control": [
+            "order", "buy", "pizza", "coffee", "call", "text",
+            "go to", "navigate", "take me to", "drive to", "head to",
+            "weather", "news",
+        ],
+        "payment": [
+            "go to", "navigate", "take me to", "drive to", "head to",
+            "switch", "turn on", "turn off", "ac", "heater",
+            "weather", "news", "call", "text",
+        ],
+    }
+
+    def _should_escape_slot_fill(self, user_input: str) -> bool:
         """Return True if the input looks like a new intent rather than a slot answer."""
         text = user_input.lower().strip()
         if any(w in text for w in ["cancel", "never mind", "nevermind", "forget it", "stop", "abort"]):
@@ -1209,6 +1245,10 @@ class DialogueManager:
             return True
         if len(user_input.split()) > 6:
             return True
+        current = self.state.current_intent or ""
+        for kw in self._CROSS_INTENT_KEYWORDS.get(current, []):
+            if kw in text:
+                return True
         return False
 
     @staticmethod
@@ -1502,10 +1542,12 @@ class DialogueManager:
             if remaining:
                 next_entities["pending_order_queue"] = remaining
             next_response = handle_order_flow(next_entities, next_item["item"], self.state)
-            combined_msg = f"{payment_msg} Now ordering your {next_item['item']}. {next_response['message']}"
+            next_msg = next_response.get("nova_says") or next_response.get("message", "")
+            next_state = next_response.get("fsm_state") or next_response.get("state", "IDLE")
+            combined_msg = f"{payment_msg} Now ordering your {next_item['item']}. {next_msg}"
             return build_response(
                 message=combined_msg,
-                state=next_response["state"], intent="payment",
+                state=next_state, intent="payment",
                 routing="Nova Pay — compound order chained",
                 action=next_response.get("action", "payment_confirmed"),
                 entities={**payment_entities, **self.state.pending_entities}

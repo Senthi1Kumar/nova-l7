@@ -102,11 +102,13 @@ def extract_entities(text: str, intent: str) -> dict:
 
     if intent == "navigation":
         dest_match = re.search(
-            r"(?:go to|navigate to|take me to|get me to|drive to|head to|route to|directions? to)\s+(.+)",
+            r"(?:go(?:ing)? to|navigate to|take me to|get me to|driv(?:e|ing) to|"
+            r"head(?:ed|ing)? to|route to|directions? to|"
+            r"(?:i(?:'m| am) )?on (?:my|the) way to)\s+(.+)",
             text_lower
         )
         if dest_match:
-            entities["destination"] = dest_match.group(1).strip()
+            entities["destination"] = dest_match.group(1).strip().rstrip(".?!")
         else:
             entities["destination"] = None
 

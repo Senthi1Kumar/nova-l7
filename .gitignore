@@ -1,0 +1,5 @@
+# SpeechBrain auto-downloaded pretrained weights
+L-3/pretrained_models/
+L-3/pretrained_models_pvad/
+__pycache__/
+*.pyc
