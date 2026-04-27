@@ -659,6 +659,24 @@ class DialogueManager:
         if (time.time() - self.state.last_interaction) > CONTEXT_DECAY_SECONDS:
             self.state.history = []
 
+    def end_conversation(self, reason: str = "") -> None:
+        """Reset turn-scoped state when the gateway drops the WARM window.
+
+        Fires deterministically on `conversation_closed` from the gateway,
+        instead of waiting for the next user utterance + CONTEXT_DECAY_SECONDS.
+        Preserves session_token / identity — only clears what would pollute a
+        fresh conversation (history for pronoun resolution, queued intents,
+        pending slot-fill, last-vehicle-components).
+        """
+        self.state.history = []
+        self.state.intent_queue.clear()
+        self.state.last_vehicle_components = []
+        self.state.is_speaking = False
+        self._paused_intent = None
+        self._paused_entities = None
+        self._last_nova_response = None
+        print(f"[dialogue] conversation closed ({reason}) — history cleared")
+
     def _add_to_history(self, role: str, text: str, intent: str):
         self.state.history.append(ConversationTurn(role=role, text=text, intent=intent))
         if len(self.state.history) > 10:
